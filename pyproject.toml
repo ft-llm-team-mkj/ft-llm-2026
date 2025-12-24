@@ -1,0 +1,18 @@
+[project]
+name = "ft-llm-2026"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "accelerate>=0.34.0",
+    "datasets>=3.0.0",
+    "torch>=2.2.0",
+    "transformers>=4.46.0",
+    "trl>=0.12.0",
+    "unsloth[colab-new]>=2025.12.8",
+    "wandb>=0.23.1",
+]
+
+[tool.uv.sources]
+unsloth = { git = "https://github.com/unslothai/unsloth.git" }

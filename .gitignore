@@ -1,0 +1,9 @@
+logs/
+*/logs/
+
+# unsloth関連
+tuning/unsloth_compiled_cache/
+
+# Claude 関連
+.claude/
+CLAUDE.md
