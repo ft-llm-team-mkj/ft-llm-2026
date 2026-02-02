@@ -10,6 +10,11 @@ Stage: builder
     mkdir -p ${SINGULARITY_ROOTFS}/root/.cache/uv
 
 %post
+    # Install build dependencies for math_verify and other packages
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        && rm -rf /var/lib/apt/lists/*
+
     export UV_COMPILE_BYTECODE=1
     export UV_LINK_MODE=copy
     export UV_NO_EDITABLE=1
@@ -26,7 +31,7 @@ Stage: final
 
 %setup
     mkdir -p ${SINGULARITY_ROOTFS}/app/models
-    MODEL_NAMES={{ MODEL_NAMES }}
+    MODEL_NAMES="{{ MODEL_NAMES }}"
 
     if [[ -n "${MODEL_NAMES}" ]]; then
         for model in ${MODEL_NAMES}; do
@@ -34,6 +39,7 @@ Stage: final
                 echo "Requested model directory models/${model} was not found" >&2
                 exit 1
             fi
+            mkdir -p "${SINGULARITY_ROOTFS}/app/models/${model}"
             rsync -av "models/${model}/" "${SINGULARITY_ROOTFS}/app/models/${model}/"
         done
     else
@@ -61,4 +67,4 @@ Stage: final
 
 %runscript
     cd /app
-    python3 main.py "$@"
+    python main.py "$@"

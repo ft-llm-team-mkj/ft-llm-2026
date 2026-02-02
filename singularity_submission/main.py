@@ -1,62 +1,455 @@
 import argparse
 import json
+import multiprocessing as mp
+import os
 from pathlib import Path
+from collections import Counter
+from math_verify import parse, verify
+
+# UUID が入っている場合，数値インデックスに置き換える
+if 'CUDA_VISIBLE_DEVICES' in os.environ:
+    devices = os.environ['CUDA_VISIBLE_DEVICES'].split(',')
+    if devices and not devices[0].isdigit():
+        # UUID が N 個あれば 0,1,...,N-1 に置き換え
+        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(i) for i in range(len(devices)))
 
 from vllm import LLM, SamplingParams
 
 
-PROMPT_TEMPLATE = """\
-以下は数学の問題です。
-問題に対する解答のみを出力してください。
-推論過程は出力しないでください。
+# Translation prompts
+TRANSLATION_SYSTEM_PROMPT = "以下は、タスクを説明する指示と、文脈のある入力の組み合わせです。要求を適切に満たす応答を書きなさい。"
+TRANSLATION_USER_PROMPT = "以下の日本語テキストを英語に翻訳してください。\n\n{}"
 
-# 問題
-{question}
+# Reasoning prompts
+REASONING_SYSTEM_PROMPT = "The following is a combination of an instruction that describes a task and an input that provides context. Write a response that appropriately fulfills the request."
+REASONING_USER_PROMPT = "Please solve following question.\n\nQuestion: {}"
 
-# 解答
-"""
+
+def extract_final_answer(output: str) -> str:
+    """Extract the final answer from model output, removing <think> tags if present."""
+    # If output contains </think> tag, extract everything after it
+    if '</think>' in output:
+        answer = output.split('</think>')[-1].strip()
+        return answer
+    return output.strip()
+
+
+def safe_math_verify(answer1: str, answer2: str, timeout_seconds: float = 4.0) -> bool:
+    """Safely verify if two mathematical answers are equivalent with timeout protection.
+
+    Args:
+        answer1: First answer string
+        answer2: Second answer string
+        timeout_seconds: Maximum time to allow for verification
+
+    Returns:
+        True if answers are mathematically equivalent, False otherwise
+    """
+    import signal
+    from contextlib import contextmanager
+
+    @contextmanager
+    def time_limit(seconds):
+        def signal_handler(signum, frame):
+            raise TimeoutError("Timed out!")
+        signal.signal(signal.SIGALRM, signal_handler)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        try:
+            yield
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+
+    try:
+        with time_limit(timeout_seconds):
+            parsed1 = parse(answer1)
+            parsed2 = parse(answer2)
+            return verify(parsed1, parsed2)
+    except TimeoutError:
+        # Timeout during comparison - fall back to string matching
+        return answer1.strip() == answer2.strip()
+    except Exception:
+        # Any other error - fall back to string matching
+        return answer1.strip() == answer2.strip()
+
+
+def majority_voting_with_math_verify(votes: list[str]) -> tuple[str, int]:
+    """Perform majority voting using math-verify for mathematical equivalence checking.
+
+    Args:
+        votes: List of answer strings to vote on
+
+    Returns:
+        (most_common_answer, count): The answer with most votes and its count
+    """
+    if not votes:
+        return "", 0
+
+    # Group answers by mathematical equivalence
+    groups = []  # List of lists: each sublist contains equivalent answers
+
+    for vote in votes:
+        # Try to find an existing group where this vote is equivalent
+        found_group = False
+
+        for group in groups:
+            # Compare with the first element of each group using safe verification
+            if safe_math_verify(group[0], vote):
+                group.append(vote)
+                found_group = True
+                break
+
+        # If no equivalent group found, create a new group
+        if not found_group:
+            groups.append([vote])
+
+    # Find the largest group (most votes)
+    largest_group = max(groups, key=len)
+
+    # Return the first answer from the largest group and the group size
+    return largest_group[0], len(largest_group)
+
+
+def translate_problems(translator_model_path: Path, problems: list[dict], num_translations: int = 4) -> list[list[str]]:
+    """Translate Japanese problems to English using all 8 GPUs.
+
+    Args:
+        translator_model_path: Path to translator model
+        problems: List of problem dictionaries
+        num_translations: Number of translations per problem (default: 4)
+
+    Returns:
+        List of lists: [problem_idx][translation_idx] -> translation string
+    """
+    print(f"Loading translator model from {translator_model_path}...")
+    llm = LLM(
+        model=str(translator_model_path.resolve()),
+        tensor_parallel_size=8,  # Can use 8 with sharded model for fast parallel loading
+        max_model_len=4096
+    )
+
+    # Create messages: repeat each problem num_translations times
+    messages = []
+    for problem in problems:
+        for _ in range(num_translations):
+            messages.append([
+                {"role": "system", "content": TRANSLATION_SYSTEM_PROMPT},
+                {"role": "user", "content": TRANSLATION_USER_PROMPT.format(problem["problem"])}
+            ])
+
+    print(f"Translating {len(problems)} problems x {num_translations} samples = {len(messages)} total with TP=8...")
+    outputs = llm.chat(
+        messages,
+        sampling_params=SamplingParams(temperature=0.6, max_tokens=2048)
+    )
+
+    # Organize translations by problem
+    all_translations = [output.outputs[0].text.strip() for output in outputs]
+    translated_problems = []
+    for i in range(len(problems)):
+        start_idx = i * num_translations
+        end_idx = start_idx + num_translations
+        translated_problems.append(all_translations[start_idx:end_idx])
+
+    # Clean up translator model
+    del llm
+    import gc
+    import torch
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return translated_problems
+
+
+def run_agent_worker(
+    gpu_ids: str,
+    model_path: str,
+    all_translation_samples: list[str],
+    agent_id: int,
+    return_dict: dict,
+    num_samples_per_translation: int = 5
+):
+    """Worker function for each reasoning agent running on specific GPUs.
+
+    Args:
+        all_translation_samples: Flat list of all translation samples (num_problems * num_translations)
+        num_samples_per_translation: Number of reasoning samples per translation
+    """
+    # Set GPU visibility for this process
+    os.environ['CUDA_VISIBLE_DEVICES'] = gpu_ids
+
+    print(f"Agent {agent_id} starting on GPUs {gpu_ids}...")
+
+    from vllm import LLM, SamplingParams
+
+    llm = LLM(
+        model=model_path,
+        tensor_parallel_size=2,
+        max_model_len=8192
+    )
+
+    # Repeat each translation sample num_samples_per_translation times
+    messages = []
+    for translation in all_translation_samples:
+        for _ in range(num_samples_per_translation):
+            messages.append([
+                {"role": "system", "content": REASONING_SYSTEM_PROMPT},
+                {"role": "user", "content": REASONING_USER_PROMPT.format(translation)}
+            ])
+
+    print(f"Agent {agent_id} solving {len(all_translation_samples)} translation samples x {num_samples_per_translation} reasoning samples = {len(messages)} total...")
+    outputs = llm.chat(
+        messages,
+        sampling_params=SamplingParams(temperature=0.8, max_tokens=4096)
+    )
+
+    # Store raw outputs (with <think> tags)
+    all_raw_results = [output.outputs[0].text.strip() for output in outputs]
+
+    # Extract final answers (without <think> tags) for voting
+    all_final_results = [extract_final_answer(raw) for raw in all_raw_results]
+
+    # Organize results by translation sample (each translation has num_samples_per_translation answers)
+    raw_results = []
+    final_results = []
+    for i in range(len(all_translation_samples)):
+        start_idx = i * num_samples_per_translation
+        end_idx = start_idx + num_samples_per_translation
+        raw_results.append(all_raw_results[start_idx:end_idx])
+        final_results.append(all_final_results[start_idx:end_idx])
+
+    return_dict[agent_id] = {
+        'raw': raw_results,  # List of lists: [translation_sample][reasoning_sample]
+        'final': final_results  # List of lists: [translation_sample][reasoning_sample]
+    }
+
+    print(f"Agent {agent_id} completed!")
+
+
+def solve_with_parallel_agents(
+    reasoner_model_path: Path,
+    translated_problems: list[list[str]],
+    num_agents: int = 4,
+    num_samples_per_translation: int = 5
+) -> tuple[list[str], dict]:
+    """Solve problems using 4 parallel agents, each with 2 GPUs.
+
+    Args:
+        translated_problems: List of lists [problem_idx][translation_idx] -> translation
+        num_agents: Number of parallel agents (default: 4)
+        num_samples_per_translation: Number of reasoning samples per translation (default: 5)
+
+    Returns:
+        (final_answers, all_agent_answers):
+            - final_answers: list of majority-voted answers (one per original problem)
+            - all_agent_answers: dict mapping agent_id to results
+    """
+    num_problems = len(translated_problems)
+    num_translations_per_problem = len(translated_problems[0]) if translated_problems else 0
+
+    print(f"\nStarting {num_agents} parallel reasoning agents...")
+    print(f"Each problem has {num_translations_per_problem} translations")
+    print(f"Each agent will solve each translation {num_samples_per_translation} times")
+    print(f"Total samples per problem: {num_translations_per_problem} translations × {num_agents} agents × {num_samples_per_translation} samples = {num_translations_per_problem * num_agents * num_samples_per_translation}")
+
+    # Flatten translations to a single list
+    all_translation_samples = []
+    for translations in translated_problems:
+        all_translation_samples.extend(translations)
+
+    # GPU assignments: Agent 0 -> GPU 0,1; Agent 1 -> GPU 2,3; etc.
+    gpu_assignments = ["0,1", "2,3", "4,5", "6,7"]
+
+    # Use spawn method to ensure clean process separation
+    mp.set_start_method('spawn', force=True)
+
+    manager = mp.Manager()
+    return_dict = manager.dict()
+
+    processes = []
+    for i in range(num_agents):
+        p = mp.Process(
+            target=run_agent_worker,
+            args=(
+                gpu_assignments[i],
+                str(reasoner_model_path.resolve()),
+                all_translation_samples,
+                i,
+                return_dict,
+                num_samples_per_translation
+            )
+        )
+        p.start()
+        processes.append(p)
+
+    # Wait for all agents to complete
+    for p in processes:
+        p.join()
+
+    print("\nAll agents completed. Performing majority voting...")
+
+    # Convert manager.dict to regular dict for return
+    all_agent_answers = {agent_id: return_dict[agent_id] for agent_id in range(num_agents)}
+
+    # Majority voting: for each original problem, collect votes from all translations, all agents, all samples
+    final_answers = []
+    for problem_idx in range(num_problems):
+        # Collect ALL votes for this problem across all translations, agents, and samples
+        votes = []
+        for translation_idx in range(num_translations_per_problem):
+            # Global index in the flattened translation list
+            global_translation_idx = problem_idx * num_translations_per_problem + translation_idx
+
+            for agent_id in range(num_agents):
+                # Each agent has num_samples_per_translation answers for this translation
+                votes.extend(return_dict[agent_id]['final'][global_translation_idx])
+
+        # Majority vote across all samples using mathematical equivalence
+        most_common_answer, count = majority_voting_with_math_verify(votes)
+
+        total_votes = num_translations_per_problem * num_agents * num_samples_per_translation
+        print(f"Problem {problem_idx+1}: {count}/{total_votes} samples agreed on the answer (using math-verify)")
+        final_answers.append(most_common_answer)
+
+    return final_answers, all_agent_answers
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Singularity Submission Example")
+    parser = argparse.ArgumentParser(description="Multi-Agent Math Reasoning Pipeline")
     parser.add_argument(
-        "--model_path", type=Path, required=True, help="Path to the model directory"
+        "--translator_path",
+        type=Path,
+        default=Path("/app/models/ft-llm-team-mkj/math-translator_v2_sharded"),
+        help="Path to the translator model directory"
     )
     parser.add_argument(
-        "--input_path", type=Path, required=True, help="Path to the input file"
+        "--reasoner_path",
+        type=Path,
+        default=Path("/app/models/ft-llm-team-mkj/math-reasoner-v2"),  # Already sharded
+        help="Path to the reasoner model directory"
     )
     parser.add_argument(
-        "--output_path", type=Path, required=True, help="Path to the output file"
+        "--input_path",
+        type=Path,
+        required=True,
+        help="Path to the input JSONL file"
+    )
+    parser.add_argument(
+        "--output_path",
+        type=Path,
+        required=True,
+        help="Path to the output JSONL file"
+    )
+    parser.add_argument(
+        "--num_agents",
+        type=int,
+        default=4,
+        help="Number of reasoning agents for majority voting"
+    )
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=5,
+        help="Number of reasoning samples per translation per agent"
+    )
+    parser.add_argument(
+        "--num_translations",
+        type=int,
+        default=4,
+        help="Number of translations per problem"
     )
 
     args = parser.parse_args()
 
-    llm = LLM(model=str(args.model_path.resolve()))
-
+    # Load problems
+    print(f"Loading problems from {args.input_path}...")
     with open(args.input_path) as f:
         problems = list(map(json.loads, f))
+    print(f"Loaded {len(problems)} problems\n")
 
-    messages = []
-    for problem in problems:
-        messages.append(
-            [
-                {
-                    "role": "user",
-                    "content": PROMPT_TEMPLATE.format(question=problem["problem"]),
-                }
-            ]
-        )
+    # Step 1: Translate problems to English (TP=8, all GPUs)
+    print("=" * 60)
+    print(f"STEP 1: Translation (TP=8, {args.num_translations} samples per problem, temp=0.6)")
+    print("=" * 60)
+    translated_problems = translate_problems(args.translator_path, problems, num_translations=args.num_translations)
 
-    outputs = llm.chat(
-        messages, sampling_params=SamplingParams(temperature=0.0, max_tokens=64)
+    # Save translations
+    translation_output_path = args.output_path.parent / "translations.jsonl"
+    print(f"Writing translations to {translation_output_path}...")
+    with open(translation_output_path, "w") as f:
+        for problem, translations in zip(problems, translated_problems):
+            for translation_idx, translation in enumerate(translations):
+                translation_data = problem.copy()
+                translation_data["translation_id"] = translation_idx
+                translation_data["translation"] = translation
+                f.write(json.dumps(translation_data, ensure_ascii=False) + "\n")
+
+    # Step 2: Solve with 4 parallel agents (each TP=2)
+    print("\n" + "=" * 60)
+    print(f"STEP 2: Parallel Reasoning ({args.num_agents} agents, each TP=2, {args.num_samples} samples per translation, temp=0.8)")
+    print("=" * 60)
+    final_answers, all_agent_answers = solve_with_parallel_agents(
+        args.reasoner_path,
+        translated_problems,
+        num_agents=args.num_agents,
+        num_samples_per_translation=args.num_samples
     )
 
-    for problem, output in zip(problems, outputs):
-        problem["output"] = output.outputs[0].text
+    # Step 3: Write results
+    print("\n" + "=" * 60)
+    print("STEP 3: Writing Results")
+    print("=" * 60)
+    for problem, answer in zip(problems, final_answers):
+        problem["output"] = answer
 
+    print(f"Writing results to {args.output_path}...")
     with open(args.output_path, "w") as f:
         for problem in problems:
             f.write(json.dumps(problem, ensure_ascii=False) + "\n")
+
+    # Step 4: Write individual agent answers (with both raw and final)
+    output_dir = args.output_path.parent
+    num_translations_per_problem = args.num_translations
+
+    for agent_id in range(args.num_agents):
+        # Write raw outputs (with <think> tags) - all samples
+        agent_raw_path = output_dir / f"agent_{agent_id}_raw.jsonl"
+        print(f"Writing agent {agent_id} raw results to {agent_raw_path}...")
+        with open(agent_raw_path, "w") as f:
+            for problem_idx, problem in enumerate(problems):
+                for translation_idx in range(num_translations_per_problem):
+                    # Global index in the flattened translation list
+                    global_translation_idx = problem_idx * num_translations_per_problem + translation_idx
+                    raw_samples = all_agent_answers[agent_id]['raw'][global_translation_idx]
+
+                    # raw_samples is a list of reasoning answers for this translation
+                    for sample_idx, answer in enumerate(raw_samples):
+                        agent_problem = problem.copy()
+                        agent_problem["agent_id"] = agent_id
+                        agent_problem["translation_id"] = translation_idx
+                        agent_problem["sample_id"] = sample_idx
+                        agent_problem["output"] = answer
+                        f.write(json.dumps(agent_problem, ensure_ascii=False) + "\n")
+
+        # Write final outputs (parsed, without <think> tags) - all samples
+        agent_final_path = output_dir / f"agent_{agent_id}_final.jsonl"
+        print(f"Writing agent {agent_id} final results to {agent_final_path}...")
+        with open(agent_final_path, "w") as f:
+            for problem_idx, problem in enumerate(problems):
+                for translation_idx in range(num_translations_per_problem):
+                    # Global index in the flattened translation list
+                    global_translation_idx = problem_idx * num_translations_per_problem + translation_idx
+                    final_samples = all_agent_answers[agent_id]['final'][global_translation_idx]
+
+                    # final_samples is a list of reasoning answers for this translation
+                    for sample_idx, answer in enumerate(final_samples):
+                        agent_problem = problem.copy()
+                        agent_problem["agent_id"] = agent_id
+                        agent_problem["translation_id"] = translation_idx
+                        agent_problem["sample_id"] = sample_idx
+                        agent_problem["output"] = answer
+                        f.write(json.dumps(agent_problem, ensure_ascii=False) + "\n")
+
+    print("\nDone!")
 
 
 if __name__ == "__main__":
