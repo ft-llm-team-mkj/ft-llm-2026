@@ -203,7 +203,7 @@ def run_agent_worker(
 
     llm = LLM(
         model=model_path,
-        tensor_parallel_size=1,
+        tensor_parallel_size=2,
         max_model_len=16384
     )
 
@@ -219,7 +219,7 @@ def run_agent_worker(
     print(f"Agent {agent_id} solving {len(all_translation_samples)} translation samples x {num_samples_per_translation} reasoning samples = {len(messages)} total...")
     outputs = llm.chat(
         messages,
-        sampling_params=SamplingParams(temperature=0.7, max_tokens=16384)
+        sampling_params=SamplingParams(temperature=0.6, max_tokens=16384)
     )
 
     # Store raw outputs (with <tool_call> tags)
@@ -246,17 +246,16 @@ def run_agent_worker(
 
 
 def solve_with_parallel_agents(
-    reasoner_model_paths: list[Path],
+    reasoner_model_path: Path,
     translated_problems: list[list[str]],
     num_agents: int = 4,
     num_samples_per_translation: int = 5
 ) -> tuple[list[str], dict]:
-    """Solve problems using 8 parallel agents, each with 1 GPU.
+    """Solve problems using 4 parallel agents, each with 2 GPUs.
 
     Args:
-        reasoner_model_paths: List of model paths, one per agent
         translated_problems: List of lists [problem_idx][translation_idx] -> translation
-        num_agents: Number of parallel agents (default: 8)
+        num_agents: Number of parallel agents (default: 4)
         num_samples_per_translation: Number of reasoning samples per translation (default: 5)
 
     Returns:
@@ -277,8 +276,8 @@ def solve_with_parallel_agents(
     for translations in translated_problems:
         all_translation_samples.extend(translations)
 
-    # GPU assignments: 1 GPU per agent
-    gpu_assignments = [str(i) for i in range(8)]
+    # GPU assignments: Agent 0 -> GPU 0,1; Agent 1 -> GPU 2,3; etc.
+    gpu_assignments = ["0,1", "2,3", "4,5", "6,7"]
 
     # Use spawn method to ensure clean process separation
     mp.set_start_method('spawn', force=True)
@@ -292,7 +291,7 @@ def solve_with_parallel_agents(
             target=run_agent_worker,
             args=(
                 gpu_assignments[i],
-                str(reasoner_model_paths[i].resolve()),
+                str(reasoner_model_path.resolve()),
                 all_translation_samples,
                 i,
                 return_dict,
@@ -346,13 +345,7 @@ def main():
         "--reasoner_path",
         type=Path,
         default=Path("/app/models/ft-llm-team-mkj/math-reasoner-v2"),  # Already sharded
-        help="Path to the reasoner model directory (used by agents 0-1)"
-    )
-    parser.add_argument(
-        "--reasoner_path_v5",
-        type=Path,
-        default=Path("/app/models/ft-llm-team-mkj/math-reasoner-v5"),
-        help="Path to the reasoner v5 model directory (used by agents 2-3)"
+        help="Path to the reasoner model directory"
     )
     parser.add_argument(
         "--input_path",
@@ -369,7 +362,7 @@ def main():
     parser.add_argument(
         "--num_agents",
         type=int,
-        default=8,
+        default=4,
         help="Number of reasoning agents for majority voting"
     )
     parser.add_argument(
@@ -410,18 +403,12 @@ def main():
                 translation_data["translation"] = translation
                 f.write(json.dumps(translation_data, ensure_ascii=False) + "\n")
 
-    # Step 2: Solve with 8 parallel agents (each TP=1)
-    # Agents 0-5 use reasoner_path (v2), Agents 6-7 use reasoner_path_v5
-    reasoner_model_paths = [args.reasoner_path] * 6 + [args.reasoner_path_v5] * 2
-    reasoner_model_paths = reasoner_model_paths[:args.num_agents]
-
+    # Step 2: Solve with 4 parallel agents (each TP=2)
     print("\n" + "=" * 60)
-    print(f"STEP 2: Parallel Reasoning ({args.num_agents} agents, each TP=1, {args.num_samples} samples per translation, temp=0.6)")
-    for i, p in enumerate(reasoner_model_paths):
-        print(f"  Agent {i}: {p}")
+    print(f"STEP 2: Parallel Reasoning ({args.num_agents} agents, each TP=2, {args.num_samples} samples per translation, temp=0.8)")
     print("=" * 60)
     final_answers, all_agent_answers = solve_with_parallel_agents(
-        reasoner_model_paths,
+        args.reasoner_path,
         translated_problems,
         num_agents=args.num_agents,
         num_samples_per_translation=args.num_samples

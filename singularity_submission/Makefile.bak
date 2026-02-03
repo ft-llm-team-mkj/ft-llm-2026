@@ -1,8 +1,7 @@
 TRANSLATOR_MODEL := ft-llm-team-mkj/math-translator_v2_sharded
 REASONER_MODEL := ft-llm-team-mkj/math-reasoner-v2
-REASONER_MODEL_V5 := ft-llm-team-mkj/math-reasoner-v5
 
-MODEL_NAMES := $(TRANSLATOR_MODEL) $(REASONER_MODEL) $(REASONER_MODEL_V5)
+MODEL_NAMES := $(TRANSLATOR_MODEL) $(REASONER_MODEL)
 MODEL_DIRS := $(MODEL_NAMES:%=models/%)
 
 UV_CACHE_DIR := $(shell uv cache dir)
@@ -34,7 +33,6 @@ run: dist/submission.sif $(MODEL_DIRS)
 	    dist/submission.sif \
 	    --translator_path /app/models/$(TRANSLATOR_MODEL) \
 	    --reasoner_path /app/models/$(REASONER_MODEL) \
-	    --reasoner_path_v5 /app/models/$(REASONER_MODEL_V5) \
 	    --input_path /app/sample_problems.jsonl \
 	    --output_path /tmp/output.jsonl
 
@@ -43,7 +41,6 @@ test-local: $(MODEL_DIRS)
 	uv run python main.py \
 	    --translator_path models/$(TRANSLATOR_MODEL) \
 	    --reasoner_path models/$(REASONER_MODEL) \
-	    --reasoner_path_v5 models/$(REASONER_MODEL_V5) \
 	    --input_path /home/ach18346zf/dev.jsonl \
 	    --output_path output.jsonl
 
